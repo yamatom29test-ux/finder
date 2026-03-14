@@ -1,17 +1,24 @@
 // =====================================================
-// 🧠 STEAL A BRAINROT SCANNER - BACKEND v3.9
+// 🧠 STEAL A BRAINROT SCANNER - BACKEND v4.0
 // =====================================================
 //
-// Matches SCANNER v9.0 — PERFECT SCAN + INSTANT HOP
-// + 📊 REAL-TIME HOPS TRACKING + DISCORD STATS
+// UPGRADED FROM v3.9:
+//   ✅ /api/v1/report-dead — bots report Error 2/279 → instant blacklist
+//   ✅ Keep-alive ping to prevent Render free tier sleep
+//   ✅ Reduced STALE_THRESHOLD (10min → 4min) for fresher servers
+//   ✅ Smarter cleanup + dead server propagation
+//   ✅ /alerts endpoint integrated (notifier support)
+//   ✅ BOT_REQUEST_COOLDOWN tuned for 100+ bots
 //
 // ENDPOINTS:
 //   POST /api/v1/get-job-assignment — assign servers to bot
 //   POST /api/v1/report-found — check if server already reported
 //   POST /api/v1/report-restricted — blacklist a dead server
+//   POST /api/v1/report-dead — bot reports teleport failure (Error 2/279)
 //   POST /api/v1/clear-history — reset a bot's history
 //   POST /scan-complete — bot reports real scan done (hops tracking)
 //   GET  /api/v1/stats — dashboard
+//   GET  /alerts — notifier polling endpoint
 //   GET  /health — health check
 //
 // =====================================================
@@ -101,15 +108,8 @@ function rotateOneProxy(proxy) {
     }
 }
 
-function rotateProxySessions() {
-    for (const proxy of PROXY_POOL) {
-        rotateOneProxy(proxy);
-        console.log(`   🔄 [${proxy.label}] New session → fresh IP`);
-    }
-}
-
 // =====================================================
-// ⚙️ PARAMÈTRES
+// ⚙️ PARAMÈTRES — TUNED FOR 100 BOTS + RENDER FREE
 // =====================================================
 
 const CONFIG = {
@@ -125,21 +125,40 @@ const CONFIG = {
     FETCH_MAX_CONSECUTIVE_ERRORS: 4,
     FETCH_RATE_LIMIT_BACKOFF: 5000,
     CONTINUOUS_FETCH_DELAY: 10000,
-    STALE_THRESHOLD: 600000,
+
+    // ✅ v4.0: Reduced from 600000 (10min) to 240000 (4min)
+    // Dead servers get cleared faster → less Error 2/279
+    STALE_THRESHOLD: 240000,
 
     DIRECT_PAGES: 50,
     DIRECT_PAGE_DELAY: 1000,
 
-    BOT_REQUEST_COOLDOWN: 5000,
+    // ✅ v4.0: Reduced from 5000 to 2000 for faster bot cycling
+    BOT_REQUEST_COOLDOWN: 2000,
     MAX_BOT_HISTORY: 2000,
 
     BLACKLIST_DURATION: 600000,
+
+    // ✅ v4.0: Quick blacklist for teleport failures (shorter than full blacklist)
+    DEAD_SERVER_BLACKLIST_DURATION: 180000, // 3 min blacklist for Error 2/279
+
+    // ✅ v4.0: After N reports of same server dead, extend blacklist
+    DEAD_REPORT_THRESHOLD: 2,
+    DEAD_EXTENDED_BLACKLIST: 600000, // 10 min if multiple bots report same server dead
+
     CLEANUP_INTERVAL: 10000,
 
     CYCLE_TIMEOUT: 240000,
     WATCHDOG_TIMEOUT: 300000,
     MAX_ROTATIONS: 10,
     ROTATION_NORESET_AFTER: 7,
+
+    // ✅ v4.0: Keep-alive for Render free tier
+    KEEP_ALIVE_INTERVAL: 840000, // Ping every 14 min (Render sleeps after 15)
+
+    // ✅ v4.0: Alerts retention for notifier
+    ALERTS_MAX_AGE: 300000,       // 5 min max age for alerts
+    ALERTS_MAX_COUNT: 500,        // Max alerts in memory
 };
 
 // =====================================================
@@ -262,6 +281,9 @@ const REPORT_DEDUP_DURATION = 300000;
 const botHistory = new Map();
 const botLastRequest = new Map();
 
+// ✅ v4.0: Dead server tracking — counts how many bots reported each server dead
+const deadServerReports = new Map();
+
 const stats = {
     total_requests: 0,
     total_assignments: 0,
@@ -274,6 +296,8 @@ const stats = {
     total_cycle_timeouts: 0,
     total_watchdog_resets: 0,
     total_stream_cancels: 0,
+    total_dead_reports: 0,        // ✅ v4.0
+    total_dead_blacklisted: 0,    // ✅ v4.0
     lock_max_queue: 0,
     uptime_start: Date.now()
 };
@@ -282,8 +306,7 @@ const stats = {
 // 📊 REAL-TIME HOPS TRACKING + DISCORD STATS
 // =====================================================
 
-// ⚠️ METS TON WEBHOOK DISCORD ICI ⚠️
-const DISCORD_STATS_WEBHOOK = process.env.DISCORD_WEBHOOK || 'COLLE_TON_WEBHOOK_DISCORD_ICI';
+const DISCORD_STATS_WEBHOOK = process.env.DISCORD_WEBHOOK || '';
 
 const scanTimestamps = [];
 let totalScans = 0;
@@ -310,7 +333,7 @@ function getHopsPerMinute5m() {
 }
 
 async function updateDiscordStats() {
-    if (!DISCORD_STATS_WEBHOOK || DISCORD_STATS_WEBHOOK === 'COLLE_TON_WEBHOOK_DISCORD_ICI') return;
+    if (!DISCORD_STATS_WEBHOOK) return;
 
     const hopsMin = getHopsPerMinute();
     const hops5m = getHopsPerMinute5m();
@@ -326,8 +349,10 @@ async function updateDiscordStats() {
             { name: '📊 Avg (5min)', value: `**${hops5m}** hops/min`, inline: true },
             { name: '✅ Total Scans', value: `**${totalScans.toLocaleString()}**`, inline: true },
             { name: '⏱️ Uptime', value: `${uptimeH}h ${uptimeM % 60}m`, inline: true },
+            { name: '💀 Dead Reports', value: `**${stats.total_dead_reports}** (${stats.total_dead_blacklisted} blacklisted)`, inline: true },
+            { name: '🗄️ Cache', value: `**${globalCache.jobs.length}** servers`, inline: true },
         ],
-        footer: { text: `Updated • Backend v3.9` },
+        footer: { text: `Updated • Backend v4.0` },
     };
 
     const payload = JSON.stringify({ username: 'Scanner Stats', embeds: [embed] });
@@ -357,12 +382,39 @@ setInterval(updateDiscordStats, 30000);
 setTimeout(updateDiscordStats, 10000);
 
 // =====================================================
+// 📢 ALERTS SYSTEM (for Uchiwa notifier)
+// =====================================================
+
+const alertsStore = [];
+
+function addAlert(alertData) {
+    const alert = {
+        ...alertData,
+        timestamp: alertData.timestamp || Date.now(),
+        id: crypto.randomBytes(8).toString('hex'),
+    };
+    alertsStore.push(alert);
+
+    // Trim old alerts
+    const cutoff = Date.now() - CONFIG.ALERTS_MAX_AGE;
+    while (alertsStore.length > 0 && alertsStore[0].timestamp < cutoff) {
+        alertsStore.shift();
+    }
+    while (alertsStore.length > CONFIG.ALERTS_MAX_COUNT) {
+        alertsStore.shift();
+    }
+
+    return alert;
+}
+
+// =====================================================
 // 🚫 BLACKLIST
 // =====================================================
 
-function blacklistServer(id, reason = 'unknown') {
-    serverBlacklist.set(id, { reason, expires_at: Date.now() + CONFIG.BLACKLIST_DURATION });
-    if (['restricted', 'not_found', 'timeout'].includes(reason)) {
+function blacklistServer(id, reason = 'unknown', duration = null) {
+    const dur = duration || CONFIG.BLACKLIST_DURATION;
+    serverBlacklist.set(id, { reason, expires_at: Date.now() + dur });
+    if (['restricted', 'not_found', 'timeout', 'dead_teleport'].includes(reason)) {
         const before = globalCache.jobs.length;
         globalCache.jobs = globalCache.jobs.filter(j => j.id !== id);
         if (globalCache.jobs.length < before) {
@@ -376,6 +428,56 @@ function isBlacklisted(id) {
     if (!e) return false;
     if (Date.now() > e.expires_at) { serverBlacklist.delete(id); return false; }
     return true;
+}
+
+// =====================================================
+// 💀 DEAD SERVER REPORTING (v4.0)
+// =====================================================
+
+function reportDeadServer(serverId, botId, errorCode) {
+    stats.total_dead_reports++;
+
+    const key = serverId;
+    const existing = deadServerReports.get(key);
+    const now = Date.now();
+
+    if (existing) {
+        // Don't count same bot twice
+        if (!existing.bots.has(botId)) {
+            existing.bots.add(botId);
+            existing.count++;
+            existing.lastReport = now;
+        }
+    } else {
+        deadServerReports.set(key, {
+            count: 1,
+            bots: new Set([botId]),
+            firstReport: now,
+            lastReport: now,
+            errorCode,
+        });
+    }
+
+    const report = deadServerReports.get(key);
+
+    // Always remove from assignment so other bots don't get it
+    if (serverAssignments.has(serverId)) {
+        serverAssignments.delete(serverId);
+    }
+
+    if (report.count >= CONFIG.DEAD_REPORT_THRESHOLD) {
+        // Multiple bots confirmed dead → extended blacklist
+        blacklistServer(serverId, 'dead_teleport', CONFIG.DEAD_EXTENDED_BLACKLIST);
+        stats.total_dead_blacklisted++;
+        console.log(`💀 Server ${serverId.slice(0,8)} CONFIRMED DEAD (${report.count} reports, Error ${errorCode}) → blacklisted 10min`);
+        deadServerReports.delete(key);
+        return { action: 'blacklisted_extended', reports: report.count };
+    } else {
+        // First report → quick blacklist
+        blacklistServer(serverId, 'dead_teleport', CONFIG.DEAD_SERVER_BLACKLIST_DURATION);
+        console.log(`⚠️ Server ${serverId.slice(0,8)} reported dead by ${botId} (Error ${errorCode}) → blacklisted 3min`);
+        return { action: 'blacklisted_short', reports: report.count };
+    }
 }
 
 // =====================================================
@@ -610,7 +712,7 @@ async function initialBigFetch() {
 
 async function startContinuousFetching() {
     await initialBigFetch();
-    console.log('✅ Backend v3.9 ready!\n');
+    console.log('✅ Backend v4.0 ready!\n');
     console.log('🔄 Starting continuous fetch loops...\n');
     for (let i = 0; i < PROXY_POOL.length; i++) {
         const proxy = PROXY_POOL[i];
@@ -622,6 +724,7 @@ async function startContinuousFetching() {
         }, i * 2000);
     }
 
+    // Purge stale servers every minute
     setInterval(() => {
         const now = Date.now();
         const before = globalCache.jobs.length;
@@ -721,7 +824,6 @@ function doAssign(available, bot_id, botRegion, res) {
         if (existing && existing.bot_id !== bot_id && Date.now() < existing.expires_at) {
             collisionsDetected++;
             stats.total_collisions_detected++;
-            console.error(`🚨 COLLISION: ${job.id} assigned to ${existing.bot_id}, skipping for ${bot_id}`);
             continue;
         }
         finalIds.push(job.id);
@@ -788,17 +890,45 @@ app.get('/api/v1/get-job-assignment', verifyApiKey, async (req, res) => {
 });
 
 app.post('/api/v1/report-found', verifyApiKey, (req, res) => {
-    const { bot_id, job_id } = req.body;
+    const { bot_id, job_id, brainrotName, value, serverId } = req.body;
     if (!bot_id || !job_id) return res.status(400).json({ error: 'Missing: bot_id, job_id' });
     const existing = reportedServers.get(job_id);
     const now = Date.now();
     if (existing && (now - existing.reported_at) < REPORT_DEDUP_DURATION) {
-        console.log(`🔒 ${bot_id}: server ${job_id.substring(0,8)}… already reported by ${existing.bot_id} ${Math.floor((now - existing.reported_at)/1000)}s ago`);
         return res.json({ success: true, already_reported: true, reported_by: existing.bot_id });
     }
     reportedServers.set(job_id, { bot_id, reported_at: now });
-    console.log(`📢 ${bot_id}: reported server ${job_id.substring(0,8)}… (first report)`);
+
+    // ✅ v4.0: Also push to alerts store for the notifier
+    if (brainrotName) {
+        addAlert({
+            brainrotName: brainrotName,
+            value: value || 'Unknown',
+            botId: bot_id,
+            serverId: serverId || job_id,
+            timestamp: now,
+        });
+        console.log(`📢 ${bot_id}: found ${brainrotName} [${value}] in ${(serverId || job_id).slice(0, 8)} → alert pushed`);
+    } else {
+        console.log(`📢 ${bot_id}: reported server ${job_id.substring(0, 8)}… (first report)`);
+    }
+
     return res.json({ success: true, already_reported: false });
+});
+
+// ✅ v4.0: NEW ENDPOINT — Bot reports teleport failure
+app.post('/api/v1/report-dead', verifyApiKey, (req, res) => {
+    const { bot_id, job_id, error_code } = req.body;
+    if (!bot_id || !job_id) return res.status(400).json({ error: 'Missing: bot_id, job_id' });
+
+    const result = reportDeadServer(job_id, bot_id, error_code || 0);
+
+    res.json({
+        success: true,
+        server_id: job_id,
+        ...result,
+        total_blacklisted: serverBlacklist.size,
+    });
 });
 
 app.post('/api/v1/report-restricted', verifyApiKey, (req, res) => {
@@ -819,17 +949,28 @@ app.post('/api/v1/clear-history', verifyApiKey, (req, res) => {
 
 // ── 📊 Scan complete — bot confirms real hop done ──
 app.post('/scan-complete', (req, res) => {
-    const { bot_id, job_id } = req.body || {};
     scanTimestamps.push(Date.now());
     totalScans++;
     res.json({ ok: true, hops_min: getHopsPerMinute(), total: totalScans });
+});
+
+// ✅ v4.0: Alerts endpoint for Uchiwa notifier
+app.get('/alerts', verifyApiKey, (req, res) => {
+    const since = parseInt(req.query.since) || 0;
+    const filtered = alertsStore.filter(a => a.timestamp > since);
+    res.json({
+        alerts: filtered,
+        count: filtered.length,
+        total: alertsStore.length,
+        server_time: Date.now(),
+    });
 });
 
 app.get('/api/v1/stats', (req, res) => {
     const avail = globalCache.jobs.filter(j => isServerAvailable(j.id)).length;
     res.json({
         game: STEAL_A_BRAINROT,
-        version: '3.9',
+        version: '4.0',
         cache: {
             total: globalCache.jobs.length,
             available: avail,
@@ -849,6 +990,14 @@ app.get('/api/v1/stats', (req, res) => {
             real_hops_5m_avg: getHopsPerMinute5m(),
             total_scans: totalScans,
         },
+        dead_servers: {
+            total_reports: stats.total_dead_reports,
+            total_blacklisted: stats.total_dead_blacklisted,
+            pending_reports: deadServerReports.size,
+        },
+        alerts: {
+            stored: alertsStore.length,
+        },
         lock: {
             queue_now: globalAssignmentLock.queueLength,
             queue_max_ever: stats.lock_max_queue,
@@ -866,10 +1015,9 @@ app.get('/api/v1/stats', (req, res) => {
         config: {
             cooldown_s: CONFIG.COOLDOWN_DURATION / 1000,
             servers_per_bot: CONFIG.SERVERS_PER_BOT,
-            initial_pages: CONFIG.INITIAL_PAGES_PER_PROXY,
-            continuous_pages: CONFIG.CONTINUOUS_PAGES_PER_PROXY,
-            continuous_delay_s: CONFIG.CONTINUOUS_FETCH_DELAY / 1000,
             stale_threshold_s: CONFIG.STALE_THRESHOLD / 1000,
+            dead_blacklist_s: CONFIG.DEAD_SERVER_BLACKLIST_DURATION / 1000,
+            dead_extended_s: CONFIG.DEAD_EXTENDED_BLACKLIST / 1000,
             proxy_pool_size: PROXY_POOL.length
         }
     });
@@ -877,12 +1025,12 @@ app.get('/api/v1/stats', (req, res) => {
 
 app.get('/health', (req, res) => {
     res.json({
-        status: 'ok', version: '3.9',
+        status: 'ok', version: '4.0',
         servers: globalCache.jobs.length,
         hops_min: getHopsPerMinute(),
         total_scans: totalScans,
         uptime: Math.floor(process.uptime()),
-        collisions_ever: stats.total_collisions_detected,
+        dead_reports: stats.total_dead_reports,
         memory_mb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024)
     });
 });
@@ -893,7 +1041,7 @@ app.get('/health', (req, res) => {
 
 setInterval(() => {
     const now = Date.now();
-    let cA = 0, cC = 0, cB = 0, cR = 0;
+    let cA = 0, cC = 0, cB = 0, cR = 0, cD = 0;
     for (const [id, a] of serverAssignments.entries()) {
         if (now > a.expires_at) {
             serverAssignments.delete(id);
@@ -913,11 +1061,19 @@ setInterval(() => {
     for (const [id, r] of reportedServers.entries()) {
         if (now - r.reported_at > REPORT_DEDUP_DURATION) { reportedServers.delete(id); cR++; }
     }
-    if (cA + cC + cB + cR > 0) {
-        console.log(`🧹 ${cA} assign→cd, ${cC} cd expired, ${cB} bl expired${cR > 0 ? `, ${cR} reports expired` : ''}`);
+    // ✅ v4.0: Clean old dead reports
+    for (const [id, r] of deadServerReports.entries()) {
+        if (now - r.lastReport > CONFIG.DEAD_EXTENDED_BLACKLIST) {
+            deadServerReports.delete(id);
+            cD++;
+        }
+    }
+    if (cA + cC + cB + cR + cD > 0) {
+        console.log(`🧹 ${cA} assign→cd, ${cC} cd expired, ${cB} bl expired${cR > 0 ? `, ${cR} reports` : ''}${cD > 0 ? `, ${cD} dead-reports` : ''}`);
     }
 }, CONFIG.CLEANUP_INTERVAL);
 
+// Trim bot history every 30min
 setInterval(() => {
     let trimmed = 0;
     for (const [botId, h] of botHistory.entries()) {
@@ -931,6 +1087,46 @@ setInterval(() => {
     if (trimmed > 0) console.log(`🧹 Trimmed ${trimmed} history entries`);
 }, 1800000);
 
+// Trim alerts store every minute
+setInterval(() => {
+    const cutoff = Date.now() - CONFIG.ALERTS_MAX_AGE;
+    const before = alertsStore.length;
+    while (alertsStore.length > 0 && alertsStore[0].timestamp < cutoff) {
+        alertsStore.shift();
+    }
+    const removed = before - alertsStore.length;
+    if (removed > 0) console.log(`🧹 Trimmed ${removed} old alerts → ${alertsStore.length} remaining`);
+}, 60000);
+
+// =====================================================
+// 💓 KEEP-ALIVE — Prevent Render free tier sleep
+// =====================================================
+
+function startKeepAlive() {
+    const appUrl = process.env.RENDER_EXTERNAL_URL || process.env.APP_URL;
+    if (!appUrl) {
+        console.log('⚠️ No RENDER_EXTERNAL_URL or APP_URL set — keep-alive disabled');
+        console.log('   Set APP_URL env var to your Render URL to prevent sleep');
+        return;
+    }
+
+    console.log(`💓 Keep-alive: pinging ${appUrl}/health every ${CONFIG.KEEP_ALIVE_INTERVAL / 1000}s`);
+
+    setInterval(async () => {
+        try {
+            const res = await fetch(`${appUrl}/health`);
+            if (res.ok) {
+                const data = await res.json();
+                console.log(`💓 Keep-alive OK — ${data.servers} servers, ${data.hops_min} hops/min`);
+            } else {
+                console.warn(`💓 Keep-alive responded ${res.status}`);
+            }
+        } catch (err) {
+            console.warn(`💓 Keep-alive failed: ${err.message}`);
+        }
+    }, CONFIG.KEEP_ALIVE_INTERVAL);
+}
+
 // =====================================================
 // 🚀 STARTUP
 // =====================================================
@@ -938,9 +1134,11 @@ setInterval(() => {
 app.listen(PORT, () => {
     console.clear();
     console.log('\n' + '═'.repeat(60));
-    console.log('🧠 STEAL A BRAINROT SCANNER - BACKEND v3.9');
+    console.log('🧠 STEAL A BRAINROT SCANNER - BACKEND v4.0');
     console.log('   ⚡ INSTANT COOLDOWN + ZERO COLLISION');
-    console.log('   📊 REAL-TIME HOPS TRACKING + DISCORD');
+    console.log('   💀 DEAD SERVER FEEDBACK LOOP');
+    console.log('   📢 INTEGRATED ALERTS (notifier support)');
+    console.log('   💓 RENDER KEEP-ALIVE');
     console.log('═'.repeat(60));
     console.log(`🎮 ${STEAL_A_BRAINROT.GAME_NAME}`);
     console.log(`📍 Place ID: ${STEAL_A_BRAINROT.PLACE_ID}`);
@@ -949,23 +1147,26 @@ app.listen(PORT, () => {
     console.log('');
 
     initProxyPool();
+    startKeepAlive();
 
     const totalBots = Object.values(REGIONAL_CONFIG).reduce((s, c) => s + c.expected_bots, 0);
 
     console.log('\n🔒 ANTI-COLLISION:');
     console.log('   Global lock + SHA-256 + history');
 
-    console.log('\n⚡ COOLDOWN:');
-    console.log(`   ${CONFIG.COOLDOWN_DURATION / 1000}s — starts at assignment (bot never releases)`);
-    console.log(`   Report-dedup: ${REPORT_DEDUP_DURATION / 1000}s (no duplicate Discord)`);
+    console.log('\n💀 DEAD SERVER FEEDBACK (v4.0):');
+    console.log(`   1 report → blacklist ${CONFIG.DEAD_SERVER_BLACKLIST_DURATION / 1000}s`);
+    console.log(`   ${CONFIG.DEAD_REPORT_THRESHOLD}+ reports → blacklist ${CONFIG.DEAD_EXTENDED_BLACKLIST / 1000}s`);
+    console.log(`   Stale threshold: ${CONFIG.STALE_THRESHOLD / 1000}s (was 600s in v3.9)`);
 
     console.log('\n⚡ FETCH:');
     console.log(`   🌐 ${PROXY_POOL.length} proxies — ALL running continuously`);
     console.log(`   🚀 Phase 1: Initial — ${CONFIG.INITIAL_PAGES_PER_PROXY} pages/proxy`);
     console.log(`   🔁 Phase 2: Continuous — ${CONFIG.CONTINUOUS_PAGES_PER_PROXY} pages, ${CONFIG.CONTINUOUS_FETCH_DELAY / 1000}s gap`);
 
-    console.log('\n📊 DISCORD STATS:');
-    console.log('   Updates every 30s — real hops/min from scan-complete');
+    console.log('\n📢 ALERTS:');
+    console.log(`   Max age: ${CONFIG.ALERTS_MAX_AGE / 1000}s | Max count: ${CONFIG.ALERTS_MAX_COUNT}`);
+    console.log('   GET /alerts?since=<timestamp> (for Uchiwa notifier)');
 
     console.log('\n📊 CAPACITY:');
     console.log(`   🤖 ${totalBots} bots × ${CONFIG.SERVERS_PER_BOT} servers = ${(totalBots * CONFIG.SERVERS_PER_BOT).toLocaleString()}/cycle`);
